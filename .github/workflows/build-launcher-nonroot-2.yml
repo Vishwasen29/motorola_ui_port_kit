@@ -1,0 +1,360 @@
+name: Build non-root Moto launcher
+
+on:
+  workflow_dispatch:
+    inputs:
+      dump_branch:
+        description: "lhotse dump branch"
+        default: "user-17-VWL35HV-19-ST9.2-8c0861-release-keys"
+      new_package:
+        description: "Rename launcher package (blank = keep com.motorola.launcher3)"
+        default: ""
+      keep_permissions:
+        description: "Extra permissions to keep, comma separated"
+        default: ""
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    env:
+      DUMP_BRANCH: ${{ inputs.dump_branch }}
+      NEW_PKG: ${{ inputs.new_package }}
+      KEEP_EXTRA: ${{ inputs.keep_permissions }}
+      KS_B64: ${{ secrets.KEYSTORE_B64 }}
+      KS_PASS: ${{ secrets.KS_PASS || 'android123' }}
+    steps:
+      - name: Tools
+        run: |
+          mkdir -p work out
+          SDK="${ANDROID_HOME:-/usr/local/lib/android/sdk}"
+          BT=$(ls -d "$SDK"/build-tools/* | sort -V | tail -1)
+          echo "BT=$BT" >> "$GITHUB_ENV"
+          echo "Using build-tools: $BT"
+
+      - name: Fetch launcher from dump (sparse)
+        run: |
+          git clone --filter=blob:none --no-checkout --depth 1 \
+            -b "$DUMP_BRANCH" https://dumps.tadiphone.dev/dumps/motorola/lhotse.git dump
+          cd dump
+          git sparse-checkout init --cone
+          git sparse-checkout set system_ext/priv-app/Launcher3QuickStep product/app/LauncherConfig
+          git checkout
+          ls -la system_ext/priv-app/Launcher3QuickStep product/app/LauncherConfig
+
+      - name: Write APK patcher (edits binary manifest only, no resource rebuild)
+        run: |
+          cat > patch_apk.py <<'PY'
+          #!/usr/bin/env python3
+          """Patch AndroidManifest.xml (binary AXML) inside an APK without touching resources/dex.
+
+          usage: patch_apk.py in.apk out.apk [new_package]
+          env:   KEEP_EXTRA=comma,separated,permissions
+          """
+          import os, re, struct, sys, zipfile
+
+          U16 = struct.Struct("<H")
+          U32 = struct.Struct("<I")
+          NONE = 0xFFFFFFFF
+
+          RES_STRING_POOL = 0x0001
+          RES_XML = 0x0003
+          RES_XML_START_ELEMENT = 0x0102
+          RES_XML_END_ELEMENT = 0x0103
+          RES_XML_RESOURCE_MAP = 0x0180
+          TYPE_STRING = 0x03
+          TYPE_BOOL = 0x12
+
+          KEEP = {
+              "INTERNET", "VIBRATE", "EXPAND_STATUS_BAR", "QUERY_ALL_PACKAGES",
+              "SET_WALLPAPER", "SET_WALLPAPER_HINTS", "RECEIVE_BOOT_COMPLETED",
+              "BROADCAST_STICKY", "REQUEST_DELETE_PACKAGES", "POST_NOTIFICATIONS",
+              "READ_EXTERNAL_STORAGE", "WRITE_EXTERNAL_STORAGE", "ACCESS_NETWORK_STATE",
+              "ACCESS_WIFI_STATE", "BLUETOOTH", "WAKE_LOCK", "FOREGROUND_SERVICE",
+              "READ_CONTACTS", "CALL_PHONE", "REORDER_TASKS", "GET_TASKS",
+              "SCHEDULE_EXACT_ALARM", "READ_MEDIA_IMAGES", "READ_CALL_LOG",
+              "BROADCAST_CLOSE_SYSTEM_DIALOGS", "CHANGE_CONFIGURATION",
+              "VIEW_INSTANT_APPS", "ACCESS_SHORTCUTS_PLACEHOLDER",
+          }
+          for x in filter(None, os.environ.get("KEEP_EXTRA", "").split(",")):
+              KEEP.add(x.strip().replace("android.permission.", ""))
+
+          STRIP_ATTRS = {"sharedUserId", "sharedUserLabel", "persistent", "coreApp",
+                         "requiredSystemPropertyName", "requiredSystemPropertyValue"}
+
+
+          # ---------- string pool ----------
+          def read_len16(b, o):
+              n = U16.unpack_from(b, o)[0]
+              o += 2
+              if n & 0x8000:
+                  n = ((n & 0x7FFF) << 16) | U16.unpack_from(b, o)[0]
+                  o += 2
+              return n, o
+
+
+          def read_len8(b, o):
+              n = b[o]; o += 1
+              if n & 0x80:
+                  n = ((n & 0x7F) << 8) | b[o]; o += 1
+              return n, o
+
+
+          def parse_pool(b, off):
+              typ, hsz, size, count, scount, flags, sstart, ystart = struct.unpack_from("<HHIIIIII", b, off)
+              assert typ == RES_STRING_POOL
+              assert scount == 0, "styled strings in manifest not supported"
+              utf8 = bool(flags & (1 << 8))
+              offs = struct.unpack_from("<%dI" % count, b, off + hsz)
+              base = off + sstart
+              out = []
+              for so in offs:
+                  p = base + so
+                  if utf8:
+                      _, p = read_len8(b, p)
+                      blen, p = read_len8(b, p)
+                      out.append(b[p:p + blen].decode("utf-8", "surrogatepass"))
+                  else:
+                      n, p = read_len16(b, p)
+                      out.append(b[p:p + 2 * n].decode("utf-16-le", "surrogatepass"))
+              return out, size
+
+
+          def build_pool(strings):
+              data = bytearray()
+              offs = []
+              for s in strings:
+                  offs.append(len(data))
+                  raw = s.encode("utf-16-le", "surrogatepass")
+                  n = len(raw) // 2
+                  if n >= 0x8000:
+                      data += U16.pack(0x8000 | (n >> 16)) + U16.pack(n & 0xFFFF)
+                  else:
+                      data += U16.pack(n)
+                  data += raw + b"\x00\x00"
+              while len(data) % 4:
+                  data += b"\x00"
+              hsz = 28
+              sstart = hsz + 4 * len(strings)
+              size = sstart + len(data)
+              head = struct.pack("<HHIIIIII", RES_STRING_POOL, hsz, size, len(strings), 0, 0, sstart, 0)
+              return head + struct.pack("<%dI" % len(strings), *offs) + bytes(data)
+
+
+          # ---------- manifest patching ----------
+          def patch_manifest(b, new_pkg=""):
+              typ, hsz, total = struct.unpack_from("<HHI", b, 0)
+              assert typ == RES_XML, "not binary XML"
+              pos = hsz
+              strings, psize = parse_pool(b, pos)
+              pos += psize
+              resmap = []
+              chunks = []
+              while pos < len(b):
+                  ct, ch, cs = struct.unpack_from("<HHI", b, pos)
+                  body = bytes(b[pos:pos + cs])
+                  if ct == RES_XML_RESOURCE_MAP:
+                      resmap = list(struct.unpack_from("<%dI" % ((cs - ch) // 4), b, pos + ch))
+                  else:
+                      chunks.append((ct, body))
+                  pos += cs
+
+              def S(i):
+                  return strings[i] if i != NONE and i < len(strings) else None
+
+              def res_id(name_idx):
+                  return resmap[name_idx] if name_idx < len(resmap) else 0
+
+              # find a pool index usable as the name of android:required
+              req_idx = None
+              for ct, body in chunks:
+                  if ct != RES_XML_START_ELEMENT:
+                      continue
+                  ac = U16.unpack_from(body, 28)[0]
+                  for i in range(ac):
+                      ao = 36 + 20 * i
+                      nm = U32.unpack_from(body, ao + 4)[0]
+                      if S(nm) == "required" and res_id(nm) == 0x0101028E:
+                          req_idx = nm
+              # package name
+              pkg = None
+              for ct, body in chunks:
+                  if ct == RES_XML_START_ELEMENT and S(U32.unpack_from(body, 20)[0]) == "manifest":
+                      ac = U16.unpack_from(body, 28)[0]
+                      for i in range(ac):
+                          ao = 36 + 20 * i
+                          if S(U32.unpack_from(body, ao + 4)[0]) == "package":
+                              pkg = S(U32.unpack_from(body, ao + 8)[0])
+              removed, notes = [], []
+              new_pkg_idx = None
+              if new_pkg and pkg and new_pkg != pkg:
+                  strings.append(new_pkg)
+                  new_pkg_idx = len(strings) - 1
+
+              out = []
+              i = 0
+              while i < len(chunks):
+                  ct, body = chunks[i]
+                  if ct != RES_XML_START_ELEMENT:
+                      out.append((ct, body)); i += 1; continue
+                  ename = S(U32.unpack_from(body, 20)[0])
+                  ac = U16.unpack_from(body, 28)[0]
+                  attrs = [bytearray(body[36 + 20 * k:56 + 20 * k]) for k in range(ac)]
+
+                  def aname(a): return S(U32.unpack_from(a, 4)[0])
+
+                  # drop uses-permission we don't want (leaf element: start + end)
+                  if ename in ("uses-permission", "uses-permission-sdk-23", "original-package"):
+                      nm = next((S(U32.unpack_from(a, 8)[0]) for a in attrs if aname(a) == "name"), None)
+                      keep = False
+                      if ename != "original-package":
+                          keep = bool(nm) and (
+                              (nm.startswith("android.permission.") and nm[19:] in KEEP)
+                              or nm.startswith("com.android.launcher.permission.")
+                              or (pkg and nm.startswith(pkg + ".permission.")))
+                      if not keep:
+                          nxt = chunks[i + 1][0] if i + 1 < len(chunks) else None
+                          assert nxt == RES_XML_END_ELEMENT, "unexpected child in " + ename
+                          removed.append(nm or ename)
+                          i += 2
+                          continue
+
+                  changed = False
+                  # strip attributes
+                  keep_attrs = []
+                  for a in attrs:
+                      n = aname(a)
+                      if n in STRIP_ATTRS and ename in ("manifest", "application"):
+                          changed = True
+                          continue
+                      keep_attrs.append(a)
+                  attrs = keep_attrs
+
+                  # uses-library -> required=false
+                  if ename == "uses-library":
+                      found = False
+                      for a in attrs:
+                          if aname(a) == "required":
+                              found = True
+                              if a[15] == TYPE_BOOL and U32.unpack_from(a, 16)[0] != 0:
+                                  a[16:20] = U32.pack(0); changed = True
+                      if not found and req_idx is not None:
+                          new = bytearray(20)
+                          U32.pack_into(new, 0, 0)  # placeholder, fixed below
+                          # namespace index: copy from the 'name' attribute (android ns)
+                          ns = next(U32.unpack_from(a, 0)[0] for a in attrs if aname(a) == "name")
+                          U32.pack_into(new, 0, ns)
+                          U32.pack_into(new, 4, req_idx)
+                          U32.pack_into(new, 8, NONE)
+                          U16.pack_into(new, 12, 8)
+                          new[14] = 0; new[15] = TYPE_BOOL
+                          U32.pack_into(new, 16, 0)
+                          pos_ins = len(attrs)
+                          for k, a in enumerate(attrs):
+                              if res_id(U32.unpack_from(a, 4)[0]) > 0x0101028E:
+                                  pos_ins = k; break
+                          attrs.insert(pos_ins, new); changed = True
+                      elif not found:
+                          notes.append("uses-library without required attr left as-is")
+
+                  # package rename
+                  if ename == "manifest" and new_pkg_idx is not None:
+                      for a in attrs:
+                          if aname(a) == "package":
+                              U32.pack_into(a, 8, new_pkg_idx)
+                              U32.pack_into(a, 16, new_pkg_idx)
+                              changed = True
+
+                  if changed:
+                      head = bytearray(body[:36])
+                      U16.pack_into(head, 28, len(attrs))
+                      U16.pack_into(head, 30, 0)  # idIndex
+                      U16.pack_into(head, 32, 0)  # classIndex
+                      U16.pack_into(head, 34, 0)  # styleIndex
+                      U32.pack_into(head, 4, 36 + 20 * len(attrs))
+                      body = bytes(head) + b"".join(bytes(a) for a in attrs)
+                  out.append((ct, body))
+                  i += 1
+
+              pool = build_pool(strings)
+              rm = b""
+              if resmap:
+                  rm = struct.pack("<HHI", RES_XML_RESOURCE_MAP, 8, 8 + 4 * len(resmap)) + \
+                       struct.pack("<%dI" % len(resmap), *resmap)
+              nodes = b"".join(body for _, body in out)
+              total = 8 + len(pool) + len(rm) + len(nodes)
+              return struct.pack("<HHI", RES_XML, 8, total) + pool + rm + nodes, pkg, removed, notes
+
+
+          def main():
+              src, dst = sys.argv[1], sys.argv[2]
+              new_pkg = sys.argv[3] if len(sys.argv) > 3 else ""
+              zin = zipfile.ZipFile(src)
+              manifest = zin.read("AndroidManifest.xml")
+              patched, pkg, removed, notes = patch_manifest(manifest, new_pkg)
+              print("package: %s -> %s" % (pkg, new_pkg or pkg))
+              print("stripped permissions (%d):" % len(removed))
+              for r in removed:
+                  print("  -", r)
+              for n in notes:
+                  print("note:", n)
+              with zipfile.ZipFile(dst, "w") as zout:
+                  for info in zin.infolist():
+                      n = info.filename
+                      if n.startswith("META-INF/") and re.search(r"(\.SF|\.RSA|\.DSA|\.EC|MANIFEST\.MF)$", n):
+                          continue
+                      data = patched if n == "AndroidManifest.xml" else zin.read(n)
+                      zi = zipfile.ZipInfo(n, date_time=(2009, 1, 1, 0, 0, 0))
+                      zi.compress_type = info.compress_type
+                      zi.external_attr = info.external_attr
+                      zout.writestr(zi, data)
+
+
+          if __name__ == "__main__":
+              main()
+          PY
+
+      - name: Keystore
+        run: |
+          ok=0
+          if [ -n "$KS_B64" ]; then
+            printf '%s' "$KS_B64" | tr -d ' \n\r"\047' > ks.b64.txt
+            if base64 -d ks.b64.txt > ks.jks 2>/dev/null; then
+              echo "KEYSTORE_B64 decoded: $(stat -c%s ks.jks) bytes"
+              if keytool -list -keystore ks.jks -storepass "$KS_PASS" >/dev/null 2>&1; then
+                ok=1
+                echo "Using keystore from secrets."
+              else
+                echo "::warning::KEYSTORE_B64 decoded, but KS_PASS does not open it."
+              fi
+            else
+              echo "::warning::KEYSTORE_B64 is not valid base64 (cleaned length: $(wc -c < ks.b64.txt))."
+            fi
+          else
+            echo "::warning::No KEYSTORE_B64 secret set."
+          fi
+          if [ "$ok" = 0 ]; then
+            echo "::warning::Falling back to a throwaway key."
+            rm -f ks.jks
+            keytool -genkeypair -keystore ks.jks -storepass "$KS_PASS" -keypass "$KS_PASS" \
+              -alias key -keyalg RSA -keysize 2048 -validity 10000 -dname "CN=MotoPort"
+          fi
+
+      - name: Patch manifest, align, sign
+        run: |
+          build() {
+            apk="$1"; name="$2"; pkg="$3"
+            python3 patch_apk.py "$apk" "work/$name-patched.apk" "$pkg" | tee "out/$name-report.txt"
+            "$BT/zipalign" -f -p 4 "work/$name-patched.apk" "work/$name-aligned.apk"
+            "$BT/apksigner" sign --ks ks.jks --ks-pass "pass:$KS_PASS" --key-pass "pass:$KS_PASS" \
+              --out "out/$name.apk" "work/$name-aligned.apk"
+            "$BT/apksigner" verify "out/$name.apk"
+          }
+          build dump/system_ext/priv-app/Launcher3QuickStep/Launcher3QuickStep.apk Launcher3QuickStep "$NEW_PKG"
+          build dump/product/app/LauncherConfig/LauncherConfig.apk LauncherConfig ""
+          "$BT/aapt2" dump badging out/Launcher3QuickStep.apk | grep -E "package:|sdkVersion|uses-library|launchable" \
+            | tee out/launcher-badging.txt
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: moto-launcher-nonroot
+          path: out/
