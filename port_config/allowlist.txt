@@ -1,0 +1,6 @@
+# Leave this file empty until you have reviewed work/reports/apk-inventory.csv.
+# Then add exact paths relative to motorola_dump/, one APK per line.
+# Example only (replace with a real path from your inventory):
+# product/priv-app/ExampleApp/ExampleApp.apk
+#
+# Do not blindly approve privileged apps, SystemUI, framework APKs, or lockscreen components.

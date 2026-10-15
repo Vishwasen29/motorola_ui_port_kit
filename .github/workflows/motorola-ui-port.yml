@@ -1,0 +1,122 @@
+name: Motorola Android 17 UI Port - Inventory and Package
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_dir:
+        description: "Repository-relative directory containing extracted dump (example: motorola_dump)"
+        required: true
+        default: "motorola_dump"
+        type: string
+      build_module:
+        description: "Build a module from explicitly approved APKs in port_config/allowlist.txt"
+        required: true
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+
+concurrency:
+  group: motorola-ui-port-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  inventory:
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: read
+    env:
+      SOURCE_DIR: ${{ inputs.source_dir }}
+      BUILD_MODULE: ${{ inputs.build_module }}
+      TZ: Asia/Kolkata
+
+    steps:
+      - name: Checkout porting repository
+        uses: actions/checkout@v4
+
+      - name: Validate source directory
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ ! -d "$SOURCE_DIR" ]]; then
+            echo "::error::Source directory '$SOURCE_DIR' does not exist in this repository."
+            echo "Put the extracted Motorola dump in that directory, commit it, and rerun."
+            exit 1
+          fi
+          mkdir -p work/reports work/staging work/output
+
+      - name: Install analysis tools
+        uses: android-actions/setup-android@v3
+
+      - name: Install Android build tools
+        shell: bash
+        run: |
+          set -euo pipefail
+          sdkmanager --install "platform-tools" "build-tools;35.0.0"
+          echo "$ANDROID_HOME/build-tools/35.0.0" >> "$GITHUB_PATH"
+
+      - name: Inventory APKs and inspect manifests
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 scripts/inventory.py \
+            --source "$SOURCE_DIR" \
+            --out work/reports \
+            --aapt "$(command -v aapt)"
+
+      - name: Build approved test module
+        if: ${{ inputs.build_module }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 scripts/build_module.py \
+            --source "$SOURCE_DIR" \
+            --allowlist port_config/allowlist.txt \
+            --out work/staging/motorola-ui-module
+
+          test -f work/staging/motorola-ui-module/module.prop
+          mkdir -p work/output
+          (cd work/staging && zip -qr ../output/motorola-ui-module.zip motorola-ui-module)
+          sha256sum work/output/motorola-ui-module.zip > work/output/SHA256SUMS.txt
+
+      - name: Create reports archive
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p work/reports work/output
+          {
+            echo "Motorola UI port report"
+            echo "Repository: $GITHUB_REPOSITORY"
+            echo "Commit: $GITHUB_SHA"
+            echo "Target: Infinity-X Android 17 / OnePlus 9R lemonades / SM8250"
+            echo "Source directory: $SOURCE_DIR"
+            echo "Module requested: $BUILD_MODULE"
+            echo "Generated: $(date -u +'%Y-%m-%dT%H:%M:%SZ')"
+          } > work/reports/run-info.txt
+          if [[ -d work/reports ]]; then
+            (cd work && zip -qr output/motorola-ui-reports.zip reports)
+          fi
+
+      - name: Upload reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: motorola-ui-port-reports
+          path: |
+            work/reports/
+            work/output/motorola-ui-reports.zip
+          if-no-files-found: warn
+          retention-days: 14
+
+      - name: Upload test module
+        if: ${{ always() && inputs.build_module && hashFiles('work/output/motorola-ui-module.zip') != '' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: motorola-ui-test-module
+          path: |
+            work/output/motorola-ui-module.zip
+            work/output/SHA256SUMS.txt
+          if-no-files-found: error
+          retention-days: 7
