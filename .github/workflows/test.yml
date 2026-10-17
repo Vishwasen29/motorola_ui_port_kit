@@ -1,5 +1,25 @@
 
-      - name: Audit CPU and GPU overclock sources
+name: OnePlus 9R CPU GPU Source Audit
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  source-audit:
+    runs-on: ubuntu-22.04
+
+    steps:
+      - name: Checkout kernel
+        uses: actions/checkout@v4
+        with:
+          repository: LineageOS/android_kernel_oneplus_sm8250
+          ref: lineage-24.0
+          fetch-depth: 1
+
+      - name: Audit CPU and GPU sources
         shell: bash
         run: |
           set -euo pipefail
@@ -15,42 +35,41 @@
             git status --short
 
             echo
-            echo "=== CPU frequency driver and tables ==="
+            echo "=== CPU frequency definitions ==="
             grep -RInE \
-              'cpufreq-hw-epss|qcom,lut-row-size|freq-domain|CPUFREQ|opp-hz' \
-              arch/arm64/boot/dts/vendor/qcom \
-              drivers/cpufreq \
-              drivers/soc/qcom 2>/dev/null || true
+              'cpufreq-hw-epss|qcom,cpufreq|qcom,lut-row-size|opp-hz' \
+              arch/arm64/boot/dts drivers/cpufreq drivers/soc/qcom \
+              2>/dev/null || true
 
             echo
             echo "=== GPU frequency definitions ==="
             grep -RInE \
-              'qcom,gpu-pwrlevels|qcom,gpu-freq|gpu_freq|gpu_freq_table|gpu-pwrlevel|gpucc' \
-              arch/arm64/boot/dts/vendor/qcom \
-              drivers/gpu/msm \
-              techpack 2>/dev/null || true
+              'qcom,gpu-pwrlevels|qcom,gpu-freq|gpu_freq|gpu_freq_table|gpu-pwrlevel' \
+              arch/arm64/boot/dts drivers/gpu/msm techpack \
+              2>/dev/null || true
 
             echo
-            echo "=== Clock drivers and GPU power controls ==="
+            echo "=== GPU clock and voltage controls ==="
             grep -RInE \
               'clk_set_rate|dev_pm_opp|opp-microvolt|thermal_pwrlevel|max_pwrlevel' \
               drivers/gpu/msm drivers/clk drivers/cpufreq \
               2>/dev/null || true
 
             echo
-            echo "=== Device-tree source files ==="
+            echo "=== Relevant device-tree files ==="
             find arch/arm64/boot/dts -type f \
               \( -iname '*lemonades*' -o -iname '*kona*' \
                  -o -iname '*sm8250*' \) -print
 
             echo
-            echo "=== Active build configuration ==="
-            find out -name .config -type f -print 2>/dev/null || true
+            echo "=== Kernel configuration files ==="
+            find arch/arm64/configs -type f \
+              \( -iname '*kona*' -o -iname '*lemonades*' \) -print
           } > "$REPORT"
 
           cat "$REPORT"
 
-      - name: Upload overclock source audit
+      - name: Upload audit report
         uses: actions/upload-artifact@v4
         with:
           name: oneplus9r-overclock-source-audit
