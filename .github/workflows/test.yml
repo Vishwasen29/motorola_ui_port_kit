@@ -1,0 +1,59 @@
+
+      - name: Audit CPU and GPU overclock sources
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          mkdir -p overclock-audit
+          REPORT="$GITHUB_WORKSPACE/overclock-audit/source-report.txt"
+
+          {
+            echo "=== Repository and revision ==="
+            git remote -v
+            git branch --show-current
+            git rev-parse HEAD
+            git status --short
+
+            echo
+            echo "=== CPU frequency driver and tables ==="
+            grep -RInE \
+              'cpufreq-hw-epss|qcom,lut-row-size|freq-domain|CPUFREQ|opp-hz' \
+              arch/arm64/boot/dts/vendor/qcom \
+              drivers/cpufreq \
+              drivers/soc/qcom 2>/dev/null || true
+
+            echo
+            echo "=== GPU frequency definitions ==="
+            grep -RInE \
+              'qcom,gpu-pwrlevels|qcom,gpu-freq|gpu_freq|gpu_freq_table|gpu-pwrlevel|gpucc' \
+              arch/arm64/boot/dts/vendor/qcom \
+              drivers/gpu/msm \
+              techpack 2>/dev/null || true
+
+            echo
+            echo "=== Clock drivers and GPU power controls ==="
+            grep -RInE \
+              'clk_set_rate|dev_pm_opp|opp-microvolt|thermal_pwrlevel|max_pwrlevel' \
+              drivers/gpu/msm drivers/clk drivers/cpufreq \
+              2>/dev/null || true
+
+            echo
+            echo "=== Device-tree source files ==="
+            find arch/arm64/boot/dts -type f \
+              \( -iname '*lemonades*' -o -iname '*kona*' \
+                 -o -iname '*sm8250*' \) -print
+
+            echo
+            echo "=== Active build configuration ==="
+            find out -name .config -type f -print 2>/dev/null || true
+          } > "$REPORT"
+
+          cat "$REPORT"
+
+      - name: Upload overclock source audit
+        uses: actions/upload-artifact@v4
+        with:
+          name: oneplus9r-overclock-source-audit
+          path: overclock-audit/source-report.txt
+          if-no-files-found: error
+          
